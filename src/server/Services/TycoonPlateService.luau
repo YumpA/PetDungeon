@@ -22,6 +22,7 @@ local TycoonPlateService = {}
 
 local PLATE_TAG = "TycoonPlate"
 local TEMPLATE_FOLDER_NAME = "TycoonModels"
+local OWNER_ATTRIBUTE_NAME = "OwnerUserId"
 local TOUCH_RATE_LIMIT_SECONDS = 0.75
 
 local currencyService: CurrencyService? = nil
@@ -97,7 +98,7 @@ local function getConfigFromAttributes(plate: BasePart): PlateConfig
 		NextModelName = getStringAttribute(plate, "NextModelName"),
 		CurrentModelName = getStringAttribute(plate, "CurrentModelName"),
 		BuildParentName = getStringAttribute(plate, "BuildParentName"),
-		OwnerUserId = getNumberAttribute(plate, "OwnerUserId"),
+		OwnerUserId = getNumberAttribute(plate, OWNER_ATTRIBUTE_NAME),
 		DisableAfterPurchase = getBooleanAttribute(plate, "DisableAfterPurchase"),
 	}
 end
@@ -137,8 +138,50 @@ local function resolveNextModel(config: PlateConfig): Model?
 	return findModelTemplate(config.NextModelName)
 end
 
-local function canUsePlate(player: Player, config: PlateConfig): boolean
-	return not config.OwnerUserId or config.OwnerUserId == player.UserId
+local function findOwnerUserId(instance: Instance?): number?
+	local currentInstance = instance
+	while currentInstance do
+		local ownerUserId = getNumberAttribute(currentInstance, OWNER_ATTRIBUTE_NAME)
+		if ownerUserId then
+			return ownerUserId
+		end
+
+		currentInstance = currentInstance.Parent
+	end
+
+	return nil
+end
+
+local function resolveExistingOwnerUserId(
+	plate: BasePart,
+	buildParent: Instance,
+	currentModel: Instance?,
+	config: PlateConfig
+): number?
+	return config.OwnerUserId
+		or findOwnerUserId(plate)
+		or findOwnerUserId(currentModel)
+		or findOwnerUserId(buildParent)
+end
+
+local function stampOwnerUserId(instance: Instance, ownerUserId: number)
+	instance:SetAttribute(OWNER_ATTRIBUTE_NAME, ownerUserId)
+
+	for _, descendant in instance:GetDescendants() do
+		descendant:SetAttribute(OWNER_ATTRIBUTE_NAME, ownerUserId)
+	end
+end
+
+local function bindTaggedPlateDescendants(instance: Instance)
+	for _, descendant in instance:GetDescendants() do
+		if descendant:IsA("BasePart") and CollectionService:HasTag(descendant, PLATE_TAG) then
+			TycoonPlateService.BindPlate(descendant)
+		end
+	end
+end
+
+local function canUseOwner(player: Player, ownerUserId: number?): boolean
+	return not ownerUserId or ownerUserId == player.UserId
 end
 
 local function isRateLimited(plate: BasePart, player: Player): boolean
@@ -164,10 +207,6 @@ function TycoonPlateService.BuyPlate(player: Player, plate: BasePart, configOver
 	end
 
 	local config = configOverride or getConfigFromAttributes(plate)
-	if not canUsePlate(player, config) then
-		return false
-	end
-
 	local price = config.Price or 0
 	if price < 0 then
 		return false
@@ -175,6 +214,11 @@ function TycoonPlateService.BuyPlate(player: Player, plate: BasePart, configOver
 
 	local buildParent = resolveBuildParent(plate, config)
 	local currentModel = resolveCurrentModel(buildParent, config)
+	local existingOwnerUserId = resolveExistingOwnerUserId(plate, buildParent, currentModel, config)
+	if not canUseOwner(player, existingOwnerUserId) then
+		return false
+	end
+
 	local nextTemplate = resolveNextModel(config)
 	if not nextTemplate then
 		return false
@@ -184,6 +228,7 @@ function TycoonPlateService.BuyPlate(player: Player, plate: BasePart, configOver
 		return false
 	end
 
+	local ownerUserId = existingOwnerUserId or player.UserId
 	local replacement = nextTemplate:Clone()
 	if currentModel and currentModel:IsA("Model") then
 		replacement:PivotTo(currentModel:GetPivot())
@@ -197,6 +242,13 @@ function TycoonPlateService.BuyPlate(player: Player, plate: BasePart, configOver
 	if currentModel then
 		currentModel:Destroy()
 	end
+
+	plate:SetAttribute(OWNER_ATTRIBUTE_NAME, ownerUserId)
+	if buildParent ~= workspace then
+		buildParent:SetAttribute(OWNER_ATTRIBUTE_NAME, ownerUserId)
+	end
+	stampOwnerUserId(replacement, ownerUserId)
+	bindTaggedPlateDescendants(replacement)
 
 	if config.DisableAfterPurchase then
 		disabledPlates[plate] = true
