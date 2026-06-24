@@ -10,6 +10,9 @@
     },
 
     "ServerStorage": {
+      "PetModels": {
+        "$className": "Folder"
+      },
       "TycoonModels": {
         "$className": "Folder"
       }
