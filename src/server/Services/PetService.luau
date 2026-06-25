@@ -9,6 +9,8 @@ type PetDefinition = {
 	DisplayName: string,
 	MaxHP: number,
 	Damage: number,
+	Order: number?,
+	Color: Color3?,
 	FollowOffset: Vector3?,
 }
 
@@ -31,9 +33,45 @@ local PET_ID_ATTRIBUTE_NAME = "PetId"
 local PET_HP_ATTRIBUTE_NAME = "HP"
 local PET_MAX_HP_ATTRIBUTE_NAME = "MaxHP"
 local PET_DAMAGE_ATTRIBUTE_NAME = "Damage"
+local REMOTES_FOLDER_NAME = "Remotes"
+local PET_REMOTES_FOLDER_NAME = "Pets"
+local SELECT_PET_REMOTE_NAME = "SelectPet"
 
 local activePets: { [Player]: PetState } = {}
+local selectedPetIds: { [Player]: string } = {}
 local started = false
+
+local function getPetRemotesFolder(): Folder
+	local remotesFolder = ReplicatedStorage:FindFirstChild(REMOTES_FOLDER_NAME)
+	if not remotesFolder then
+		remotesFolder = Instance.new("Folder")
+		remotesFolder.Name = REMOTES_FOLDER_NAME
+		remotesFolder.Parent = ReplicatedStorage
+	end
+
+	local petRemotesFolder = remotesFolder:FindFirstChild(PET_REMOTES_FOLDER_NAME)
+	if petRemotesFolder and petRemotesFolder:IsA("Folder") then
+		return petRemotesFolder
+	end
+
+	local newPetRemotesFolder = Instance.new("Folder")
+	newPetRemotesFolder.Name = PET_REMOTES_FOLDER_NAME
+	newPetRemotesFolder.Parent = remotesFolder
+	return newPetRemotesFolder
+end
+
+local function getSelectPetRemote(): RemoteEvent
+	local petRemotesFolder = getPetRemotesFolder()
+	local existingRemote = petRemotesFolder:FindFirstChild(SELECT_PET_REMOTE_NAME)
+	if existingRemote and existingRemote:IsA("RemoteEvent") then
+		return existingRemote
+	end
+
+	local remote = Instance.new("RemoteEvent")
+	remote.Name = SELECT_PET_REMOTE_NAME
+	remote.Parent = petRemotesFolder
+	return remote
+end
 
 local function getActivePetsFolder(): Folder
 	local folder = Workspace:FindFirstChild(ACTIVE_PETS_FOLDER_NAME)
@@ -55,7 +93,7 @@ local function createFallbackPetModel(definition: PetDefinition): Model
 	body.Name = "Body"
 	body.Shape = Enum.PartType.Ball
 	body.Size = Vector3.new(2, 2, 2)
-	body.Color = Color3.fromRGB(80, 220, 120)
+	body.Color = definition.Color or Color3.fromRGB(80, 220, 120)
 	body.Material = Enum.Material.SmoothPlastic
 	body.Parent = model
 
@@ -211,6 +249,15 @@ function PetService.GivePet(player: Player, petId: string?): Model?
 	return model
 end
 
+function PetService.SelectPet(player: Player, petId: string): boolean
+	if typeof(petId) ~= "string" or not PetDefinitions[petId] then
+		return false
+	end
+
+	selectedPetIds[player] = petId
+	return PetService.GivePet(player, petId) ~= nil
+end
+
 function PetService.GetPetStats(player: Player)
 	local state = activePets[player]
 	if not state then
@@ -245,13 +292,13 @@ end
 local function setupPlayer(player: Player)
 	player.CharacterAdded:Connect(function()
 		task.defer(function()
-			PetService.GivePet(player, DEFAULT_PET_ID)
+			PetService.GivePet(player, selectedPetIds[player] or DEFAULT_PET_ID)
 		end)
 	end)
 
 	if player.Character then
 		task.defer(function()
-			PetService.GivePet(player, DEFAULT_PET_ID)
+			PetService.GivePet(player, selectedPetIds[player] or DEFAULT_PET_ID)
 		end)
 	end
 end
@@ -263,8 +310,15 @@ function PetService.Start()
 
 	started = true
 
+	getSelectPetRemote().OnServerEvent:Connect(function(player, petId)
+		PetService.SelectPet(player, petId)
+	end)
+
 	Players.PlayerAdded:Connect(setupPlayer)
-	Players.PlayerRemoving:Connect(destroyPet)
+	Players.PlayerRemoving:Connect(function(player)
+		destroyPet(player)
+		selectedPetIds[player] = nil
+	end)
 
 	for _, player in Players:GetPlayers() do
 		setupPlayer(player)
