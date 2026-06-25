@@ -57,6 +57,9 @@
             512
           ]
         }
+      },
+      "Enemies": {
+        "$className": "Folder"
       }
     },
     "Lighting": {

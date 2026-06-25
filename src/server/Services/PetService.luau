@@ -1,3 +1,4 @@
+local CollectionService = game:GetService("CollectionService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerStorage = game:GetService("ServerStorage")
@@ -21,6 +22,7 @@ type PetState = {
 	HP: number,
 	MaxHP: number,
 	Damage: number,
+	FollowOffset: Vector3,
 }
 
 local PetService = {}
@@ -36,9 +38,22 @@ local PET_DAMAGE_ATTRIBUTE_NAME = "Damage"
 local REMOTES_FOLDER_NAME = "Remotes"
 local PET_REMOTES_FOLDER_NAME = "Pets"
 local SELECT_PET_REMOTE_NAME = "SelectPet"
+local ENEMIES_FOLDER_NAME = "Enemies"
+local ENEMY_TAG = "Enemy"
+local ENEMY_HP_ATTRIBUTE_NAME = "HP"
+local PET_FOLLOW_ATTACHMENT_NAME = "PetFollowAttachment"
+local PET_ATTACK_TARGET_ATTACHMENT_NAME = "PetAttackTargetAttachment"
+local PET_FOLLOW_POSITION_NAME = "PetFollowPosition"
+local PET_FOLLOW_ORIENTATION_NAME = "PetFollowOrientation"
+local ATTACK_SEARCH_RADIUS = 55
+local ATTACK_RANGE = 4
+local ATTACK_COOLDOWN_SECONDS = 1
+local ATTACK_LOOP_WAIT_SECONDS = 0.25
+local MOVE_TO_ENEMY_TIMEOUT_SECONDS = 3
 
 local activePets: { [Player]: PetState } = {}
 local selectedPetIds: { [Player]: string } = {}
+local attackLoopIds: { [Player]: number } = {}
 local started = false
 
 local function getPetRemotesFolder(): Folder
@@ -138,6 +153,20 @@ local function preparePetPhysics(model: Model)
 	end
 end
 
+local function getCharacterRootPart(player: Player): BasePart?
+	local character = player.Character
+	if not character then
+		return nil
+	end
+
+	local rootPart = character:FindFirstChild("HumanoidRootPart")
+	if rootPart and rootPart:IsA("BasePart") then
+		return rootPart
+	end
+
+	return nil
+end
+
 local function attachPetToCharacter(model: Model, character: Model, followOffset: Vector3)
 	local rootPart = character:FindFirstChild("HumanoidRootPart") or character:WaitForChild("HumanoidRootPart", 10)
 	if not rootPart or not rootPart:IsA("BasePart") then
@@ -150,13 +179,13 @@ local function attachPetToCharacter(model: Model, character: Model, followOffset
 		return false
 	end
 
-	local oldFollowAttachment = rootPart:FindFirstChild("PetFollowAttachment")
+	local oldFollowAttachment = rootPart:FindFirstChild(PET_FOLLOW_ATTACHMENT_NAME)
 	if oldFollowAttachment then
 		oldFollowAttachment:Destroy()
 	end
 
 	local targetAttachment = Instance.new("Attachment")
-	targetAttachment.Name = "PetFollowAttachment"
+	targetAttachment.Name = PET_FOLLOW_ATTACHMENT_NAME
 	targetAttachment.Position = followOffset
 	targetAttachment.Parent = rootPart
 
@@ -165,7 +194,7 @@ local function attachPetToCharacter(model: Model, character: Model, followOffset
 	petAttachment.Parent = petPart
 
 	local alignPosition = Instance.new("AlignPosition")
-	alignPosition.Name = "PetFollowPosition"
+	alignPosition.Name = PET_FOLLOW_POSITION_NAME
 	alignPosition.Attachment0 = petAttachment
 	alignPosition.Attachment1 = targetAttachment
 	alignPosition.MaxForce = 30000
@@ -173,7 +202,7 @@ local function attachPetToCharacter(model: Model, character: Model, followOffset
 	alignPosition.Parent = petPart
 
 	local alignOrientation = Instance.new("AlignOrientation")
-	alignOrientation.Name = "PetFollowOrientation"
+	alignOrientation.Name = PET_FOLLOW_ORIENTATION_NAME
 	alignOrientation.Attachment0 = petAttachment
 	alignOrientation.Attachment1 = targetAttachment
 	alignOrientation.MaxTorque = 30000
@@ -192,7 +221,207 @@ local function setPetAttributes(model: Model, player: Player, petId: string, hp:
 	model:SetAttribute(PET_DAMAGE_ATTRIBUTE_NAME, damage)
 end
 
+local function getEnemyRootPart(enemy: Model): BasePart?
+	local primaryPart = enemy.PrimaryPart
+	if primaryPart then
+		return primaryPart
+	end
+
+	local humanoidRootPart = enemy:FindFirstChild("HumanoidRootPart")
+	if humanoidRootPart and humanoidRootPart:IsA("BasePart") then
+		enemy.PrimaryPart = humanoidRootPart
+		return humanoidRootPart
+	end
+
+	local firstPart = enemy:FindFirstChildWhichIsA("BasePart", true)
+	if firstPart then
+		enemy.PrimaryPart = firstPart
+	end
+
+	return firstPart
+end
+
+local function isEnemyAlive(enemy: Model): boolean
+	local humanoid = enemy:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		return humanoid.Health > 0
+	end
+
+	local hp = enemy:GetAttribute(ENEMY_HP_ATTRIBUTE_NAME)
+	return typeof(hp) == "number" and hp > 0
+end
+
+local function getEnemyCandidates(): { Model }
+	local candidates = {}
+	local added: { [Model]: boolean } = {}
+
+	local enemiesFolder = Workspace:FindFirstChild(ENEMIES_FOLDER_NAME)
+	if enemiesFolder then
+		for _, descendant in enemiesFolder:GetDescendants() do
+			if descendant:IsA("Model") and not added[descendant] then
+				table.insert(candidates, descendant)
+				added[descendant] = true
+			end
+		end
+	end
+
+	for _, instance in CollectionService:GetTagged(ENEMY_TAG) do
+		local enemy = if instance:IsA("Model") then instance else instance:FindFirstAncestorOfClass("Model")
+		if enemy and not added[enemy] then
+			table.insert(candidates, enemy)
+			added[enemy] = true
+		end
+	end
+
+	return candidates
+end
+
+local function findNearestEnemy(state: PetState): Model?
+	local ownerRootPart = getCharacterRootPart(state.Owner)
+	if not ownerRootPart then
+		return nil
+	end
+
+	local nearestEnemy = nil
+	local nearestDistance = ATTACK_SEARCH_RADIUS
+
+	for _, enemy in getEnemyCandidates() do
+		if isEnemyAlive(enemy) then
+			local enemyRootPart = getEnemyRootPart(enemy)
+			if enemyRootPart then
+				local distance = (enemyRootPart.Position - ownerRootPart.Position).Magnitude
+				if distance < nearestDistance then
+					nearestDistance = distance
+					nearestEnemy = enemy
+				end
+			end
+		end
+	end
+
+	return nearestEnemy
+end
+
+local function setPetTargetAttachment(state: PetState, targetAttachment: Attachment): boolean
+	local petPart = findPrimaryPart(state.Model)
+	if not petPart then
+		return false
+	end
+
+	local alignPosition = petPart:FindFirstChild(PET_FOLLOW_POSITION_NAME)
+	local alignOrientation = petPart:FindFirstChild(PET_FOLLOW_ORIENTATION_NAME)
+	if not alignPosition or not alignPosition:IsA("AlignPosition") then
+		return false
+	end
+
+	alignPosition.Attachment1 = targetAttachment
+
+	if alignOrientation and alignOrientation:IsA("AlignOrientation") then
+		alignOrientation.Attachment1 = targetAttachment
+	end
+
+	return true
+end
+
+local function moveToEnemy(state: PetState, enemy: Model): boolean
+	local enemyRootPart = getEnemyRootPart(enemy)
+	local petPart = findPrimaryPart(state.Model)
+	if not enemyRootPart or not petPart then
+		return false
+	end
+
+	local targetAttachment = enemyRootPart:FindFirstChild(PET_ATTACK_TARGET_ATTACHMENT_NAME)
+	if not targetAttachment or not targetAttachment:IsA("Attachment") then
+		targetAttachment = Instance.new("Attachment")
+		targetAttachment.Name = PET_ATTACK_TARGET_ATTACHMENT_NAME
+		targetAttachment.Parent = enemyRootPart
+	end
+
+	if not setPetTargetAttachment(state, targetAttachment) then
+		return false
+	end
+
+	local startTime = os.clock()
+	while os.clock() - startTime < MOVE_TO_ENEMY_TIMEOUT_SECONDS do
+		if activePets[state.Owner] ~= state or not state.Model.Parent or not isEnemyAlive(enemy) then
+			return false
+		end
+
+		if (petPart.Position - enemyRootPart.Position).Magnitude <= ATTACK_RANGE then
+			return true
+		end
+
+		task.wait(ATTACK_LOOP_WAIT_SECONDS)
+	end
+
+	return false
+end
+
+local function attack(state: PetState, enemy: Model): boolean
+	if activePets[state.Owner] ~= state or not isEnemyAlive(enemy) then
+		return false
+	end
+
+	local humanoid = enemy:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		humanoid:TakeDamage(state.Damage)
+		return true
+	end
+
+	local hp = enemy:GetAttribute(ENEMY_HP_ATTRIBUTE_NAME)
+	if typeof(hp) ~= "number" then
+		return false
+	end
+
+	local newHp = math.max(0, hp - state.Damage)
+	enemy:SetAttribute(ENEMY_HP_ATTRIBUTE_NAME, newHp)
+	if newHp == 0 then
+		enemy:Destroy()
+	end
+
+	return true
+end
+
+local function returnToOwner(state: PetState): boolean
+	local ownerRootPart = getCharacterRootPart(state.Owner)
+	if not ownerRootPart then
+		return false
+	end
+
+	local followAttachment = ownerRootPart:FindFirstChild(PET_FOLLOW_ATTACHMENT_NAME)
+	if not followAttachment or not followAttachment:IsA("Attachment") then
+		followAttachment = Instance.new("Attachment")
+		followAttachment.Name = PET_FOLLOW_ATTACHMENT_NAME
+		followAttachment.Position = state.FollowOffset
+		followAttachment.Parent = ownerRootPart
+	end
+
+	return setPetTargetAttachment(state, followAttachment)
+end
+
+local function startAttackLoop(player: Player, state: PetState)
+	attackLoopIds[player] = (attackLoopIds[player] or 0) + 1
+	local loopId = attackLoopIds[player]
+
+	task.spawn(function()
+		while activePets[player] == state and attackLoopIds[player] == loopId do
+			local enemy = findNearestEnemy(state)
+			if enemy then
+				if moveToEnemy(state, enemy) then
+					attack(state, enemy)
+					task.wait(ATTACK_COOLDOWN_SECONDS)
+				end
+			elseif not enemy then
+				returnToOwner(state)
+			end
+                
+			task.wait(ATTACK_LOOP_WAIT_SECONDS)
+		end
+	end)
+end
+
 local function destroyPet(player: Player)
+	attackLoopIds[player] = (attackLoopIds[player] or 0) + 1
+
 	local state = activePets[player]
 	if not state then
 		return
@@ -244,7 +473,10 @@ function PetService.GivePet(player: Player, petId: string?): Model?
 		HP = maxHp,
 		MaxHP = maxHp,
 		Damage = damage,
+		FollowOffset = followOffset,
 	}
+
+	startAttackLoop(player, activePets[player])
 
 	return model
 end
