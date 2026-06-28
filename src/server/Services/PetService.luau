@@ -514,6 +514,7 @@ function PetService.DamagePet(player: Player, amount: number): boolean
 	state.Model:SetAttribute(PET_HP_ATTRIBUTE_NAME, state.HP)
 
 	if state.HP == 0 then
+		attackLoopIds[player] = (attackLoopIds[player] or 0) + 1
 		state.Model:Destroy()
 		activePets[player] = nil
 	end
