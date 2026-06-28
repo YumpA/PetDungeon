@@ -18,6 +18,7 @@ local REQUEST_TELEPORT_REMOTE_NAME = "RequestTeleport"
 local TELEPORT_RATE_LIMIT_SECONDS = 3
 
 local lastTeleportRequestByPlayer: { [Player]: number } = {}
+local partyService = nil
 local started = false
 
 local function getTeleportRemotesFolder(): Folder
@@ -123,6 +124,14 @@ local function isRateLimited(player: Player): boolean
 	return false
 end
 
+local function getTeleportPlayers(player: Player): ({ Player }?, string?)
+	if partyService then
+		return partyService.GetTeleportPlayers(player)
+	end
+
+	return { player }, nil
+end
+
 function TeleportPortalService.TeleportPlayerToDungeon(player: Player, dungeonId: string): boolean
 	if typeof(dungeonId) ~= "string" or isRateLimited(player) then
 		return false
@@ -139,34 +148,47 @@ function TeleportPortalService.TeleportPlayerToDungeon(player: Player, dungeonId
 		return false
 	end
 
-	local teleportOptions = Instance.new("TeleportOptions")
-	teleportOptions:SetTeleportData({
+	local players, playerError = getTeleportPlayers(player)
+	if not players then
+		warn(`Cannot teleport {player.Name}: {playerError}`)
+		return false
+	end
+
+	local teleportData = {
 		DungeonId = dungeonId,
 		FromPlaceId = game.PlaceId,
-	})
+		PartyLeaderUserId = player.UserId,
+		PartySize = #players,
+	}
 
-	local success, result = pcall(function()
+	local reserveSuccess, reservedServerAccessCode = pcall(function()
 		return TeleportService:ReserveServer(placeId)
 	end)
 
-	if success and result then
+	if not reserveSuccess or not reservedServerAccessCode then
+		warn(`Failed to reserve private server for "{dungeonId}": {reservedServerAccessCode}`)
+		return false
+	end
 
-	TeleportService:TeleportToPrivateServer(placeId, result, {player})
-	else
-		warn("Ошибка создания сервера: " .. tostring(result))
-		player:SetAttribute("Teleporting", nil)
+	local teleportSuccess, teleportError = pcall(function()
+		TeleportService:TeleportToPrivateServer(placeId, reservedServerAccessCode, players, nil, teleportData)
+	end)
+
+	if not teleportSuccess then
+		warn(`Failed to teleport group to "{dungeonId}": {teleportError}`)
 		return false
 	end
 
 	return true
 end
 
-function TeleportPortalService.Start()
+function TeleportPortalService.Start(service)
 	if started then
 		return
 	end
 
 	started = true
+	partyService = service
 
 	local portal = getOrCreatePortal()
 	local portalPart = findPortalPart(portal)
