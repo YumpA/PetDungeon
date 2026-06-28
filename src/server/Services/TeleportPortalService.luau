@@ -146,11 +146,15 @@ function TeleportPortalService.TeleportPlayerToDungeon(player: Player, dungeonId
 	})
 
 	local success, result = pcall(function()
-		return TeleportService:TeleportAsync(placeId, { player }, teleportOptions)
+		return TeleportService:ReserveServer(placeId)
 	end)
 
-	if not success then
-		warn(`Failed to teleport {player.Name} to "{dungeonId}": {result}`)
+	if success and result then
+
+	TeleportService:TeleportToPrivateServer(placeId, result, {player})
+	else
+		warn("Ошибка создания сервера: " .. tostring(result))
+		player:SetAttribute("Teleporting", nil)
 		return false
 	end
 
